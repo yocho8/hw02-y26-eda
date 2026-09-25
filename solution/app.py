@@ -4,7 +4,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from data_loading import load_records, records_to_frame
+from data_loading import load_records
+from preparation import prepare_accidents, quality_by_year
+from presentation import number, table_style, configure_charts
+
+configure_charts()
+from exploration import show_exploration
+from advanced import show_advanced, show_grid
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "raw"
@@ -17,7 +23,8 @@ st.set_page_config(page_title="Атлас аварийности", page_icon="�
 @st.cache_data(show_spinner="Читаем выгрузку…")
 def read_data(path: str, modified_ns: int, size: int) -> tuple[list[dict], pd.DataFrame]:
     records = load_records(Path(path))
-    return records, records_to_frame(records)
+    analytical = prepare_accidents(records)
+    return records, analytical
 
 
 def reset_filters() -> None:
@@ -28,11 +35,7 @@ def reset_filters() -> None:
 
 def main() -> None:
     st.title("Атлас аварийности")
-    st.caption("Каркас ДЗ 2 · данные вашего региона")
-    st.info(
-        "Здесь можно посмотреть выгрузку и выбрать данные для анализа. Добавьте свои графики, "
-        "проверки гипотез и выводы по заданию."
-    )
+    st.caption("ДТП Костромской области · исследование данных")
     files = sorted(DATA_DIR.glob("*.geojson")) + sorted(DATA_DIR.glob("*.json"))
     files = [p for p in files if not p.name.endswith(".source.json")]
     if not files:
@@ -62,10 +65,10 @@ def main() -> None:
 
     invalid_dates = int(frame["datetime"].isna().sum())
     duplicate_ids = int(frame.loc[frame["id"].notna(), "id"].duplicated().sum())
-    st.sidebar.caption(f"Исходных записей: {len(frame):,}")
+    st.sidebar.caption(f"Исходных записей: {number(len(frame))}")
     st.sidebar.caption(
-        f"Без распознанной даты: {invalid_dates:,}. "
-        f"Повторных непустых ID: {duplicate_ids:,}. Дубликаты не удалены."
+        f"Без распознанной даты: {number(invalid_dates)}. "
+        f"Повторных непустых ID: {number(duplicate_ids)}. Дубликаты не удалены."
     )
     dated = frame[frame["datetime"].notna()]
     if dated.empty:
@@ -76,7 +79,7 @@ def main() -> None:
     first, last = dated["datetime"].min().date(), dated["datetime"].max().date()
     st.sidebar.button("Сбросить фильтры", on_click=reset_filters)
     period = st.sidebar.date_input(
-        "Период", value=(first, last), min_value=first, max_value=last,
+        "Период", value=(max(first, min(last, pd.Timestamp("2015-01-01").date())), min(last, max(first, pd.Timestamp("2025-12-31").date())) ), min_value=first, max_value=last,
         key="filter_period",
     )
     if len(period) != 2:
@@ -114,21 +117,66 @@ def main() -> None:
         "без автоматической очистки."
     )
     if invalid_dates:
-        st.warning(f"Из фильтра по времени исключено записей без даты: {invalid_dates:,}.")
+        st.warning(f"Из фильтра по времени исключено записей без даты: {number(invalid_dates)}.")
     if current.empty:
         st.warning("В выбранном срезе нет записей. Измените или сбросьте фильтры.")
         return
     a, b, c = st.columns(3)
-    a.metric("Записей в срезе", f"{len(current):,}")
-    b.metric("Уникальных непустых ID", f"{current['id'].nunique():,}")
-    c.metric("Без пригодных для карты координат", f"{int((~current['map_valid']).sum()):,}")
+    a.metric("Записей в срезе", f"{number(len(current))}")
+    b.metric("Уникальных непустых ID", f"{number(current['id'].nunique())}")
+    c.metric("Исключено из карт по координатам", f"{number(int((~current.map_valid | current.coordinate_review).sum()))}")
     if len(current) < 30:
         st.warning(
             "В выборке меньше 30 записей. Посмотрите, как отдельные ДТП влияют на результат. "
             "Число 30 здесь выбрано для напоминания, а не как критерий надёжности."
         )
 
-    overview, geography, source = st.tabs(["Динамика", "Карта", "Исходные записи"])
+    overview, exploration, geography, advanced, source, quality = st.tabs(["Динамика", "Исследование", "Карта", "Статистика и проекции", "Исходные записи", "Качество данных"])
+    with advanced:
+        show_advanced(frame)
+        st.subheader("График до и после")
+        for name, caption in [("lighting_before.png", "До: наклонные подписи, недостаточно пояснений"), ("lighting_after.png", "После: сортировка, единицы и знаменатели")]:
+            asset = ROOT / "solution" / "assets" / name
+            if asset.exists():
+                st.image(str(asset), caption=caption, width="stretch")
+        st.caption("Сохранённые иллюстрации относятся к исходной выгрузке Костромской области, 2015–2025; фильтры их не меняют.")
+    with exploration:
+        show_exploration(current)
+    with quality:
+        st.subheader("Проверки текущего среза")
+        st.write("Единица анализа — одно ДТП. Исходная выгрузка сохранена без изменений; дубликаты автоматически не удаляются.")
+        st.dataframe(pd.DataFrame({
+            "Проверка": ["Повторные непустые ID", "Непригодные координаты", "Координаты требуют проверки", "Пострадавших больше, чем участников"],
+            "Записей": [int(current.loc[current.id.notna(), "id"].duplicated().sum()), int((~current.map_valid).sum()), int(current.coordinate_review.sum()), int(current.casualties_exceed_participants.sum())],
+        }), hide_index=True)
+        st.caption("Дополнительный экран координат: долгота 40–48°, широта 57–60°. Это грубая проверка, а не граница области. Точки за прямоугольником не исправляются автоматически.")
+        st.subheader("Что требует внимания")
+        issues = pd.DataFrame({
+            "Проверка": ["Нет адреса", "Число вложенных участников не совпадает со счётчиком", "Не указан родительский регион"],
+            "ДТП": [int(current.address_missing.sum()), int(current.participants_mismatch.sum()), int(current.parent_region_missing.sum())],
+        })
+        issues["Доля среза, %"] = issues["ДТП"] / len(current) * 100
+        st.table(issues.style.format({"ДТП": lambda x: number(x), "Доля среза, %": lambda x: number(x, 1)}))
+        st.caption("Проблемы могут пересекаться в одном ДТП, поэтому строки не складываются. Отсутствующий родительский регион может быть особенностью разметки, а не ошибкой. Вложенные списки не заменяют общий счётчик участников.")
+        field_names = {"id": "ID происшествия", "datetime": "Дата и время", "region": "Территория", "category": "Тип ДТП", "severity": "Тяжесть последствий", "light": "Освещение", "participants_count": "Число участников", "injured_count": "Число раненых", "dead_count": "Число погибших"}
+        missing = current[list(field_names)].isna().sum().rename_axis("Код поля").reset_index(name="Пропусков")
+        missing.insert(0, "Поле", missing["Код поля"].map(field_names))
+        missing["Доля, %"] = missing["Пропусков"] / len(current) * 100
+        if missing["Пропусков"].sum() == 0:
+            st.success(f"В девяти основных полях текущего среза ({number(len(current))} ДТП) пропусков нет: ID, дата, территория, тип ДТП, тяжесть, освещение, число участников, раненых и погибших.")
+        else:
+            st.write("Обнаруженные пропуски в основных полях")
+            st.table(missing.loc[missing["Пропусков"].gt(0), ["Поле", "Пропусков", "Доля, %"]])
+        st.subheader("Сопоставимость данных по годам")
+        coordinates, severity = quality_by_year(current)
+        st.caption("Число записей каждой исходной категории тяжести по годам текущего среза.")
+        st.dataframe(severity, hide_index=True, width="stretch")
+        st.warning("В полной выгрузке за 2020–2024 годы нет категории «Легкий». Причина неизвестна: возможно изменение регистрации или обработки. Сравнивать лёгкие и тяжёлые ДТП между годами напрямую нельзя. Для исследования используем наличие погибших по счётчику; оно совпадает с категорией «С погибшими» в этой выгрузке.")
+        st.caption("Исключение координат по годам текущего среза: знаменатель — все ДТП данного года в срезе.")
+        st.dataframe(coordinates.style.format({"Доля исключённых, %": lambda x: number(x, 2)}), hide_index=True, width="stretch")
+        st.write("Ошибки координат сосредоточены в ранних годах. Пространственные сравнения по годам могут искажаться из-за разной полноты карт.")
+        st.info("Во всех записях исходной выгрузки есть хотя бы один раненый или погибший. Результаты описывают ДТП с пострадавшими; переносить их на аварии только с материальным ущербом нельзя.")
+        st.info("Для основных сравнений выбран период 2015–2025. Январь 2026 остаётся доступен в фильтре. Наличие записей во всех месяцах не доказывает полноту регистрации ДТП.")
     with overview:
         counts = current.set_index("datetime").resample("MS").size().rename("records")
         months = pd.date_range(pd.Timestamp(start).to_period("M").start_time,
@@ -143,26 +191,30 @@ def main() -> None:
             "Первый и последний месяцы могут быть неполными. "
             "Перед сравнением проверьте, за все ли месяцы данные собраны полностью."
         )
+        peak = counts.loc[counts.records.idxmax()]
+        st.write(f"Максимум в выбранном срезе: {peak['month']:%m.%Y}, {number(peak['records'])} записей. Изменение числа записей может отражать как происшествия, так и полноту регистрации; риск поездки без транспортного потока не оцениваем.")
     with geography:
-        points = current[current["map_valid"]].copy()
+        st.caption(f"Из обеих карт исключено: {number(int((~current.map_valid).sum()))} непригодных координат и {number(int(current.coordinate_review.sum()))} точек вне диагностического прямоугольника. Остальные точки не проверены по административной границе.")
+        points = current[current.map_valid & ~current.coordinate_review].copy()
         if points.empty:
             st.info("В срезе нет пригодных для карты координат.")
         else:
             if len(points) > 5000:
                 points = points.sample(5000, random_state=42)
                 st.warning(
-                    "Для быстрого просмотра показана случайная подвыборка 5 000 точек. "
+                    "На точечной карте показана случайная подвыборка 5 000 точек. Сетка использует все проверенные точки. "
                     "Остальные показатели и CSV используют полный срез."
                 )
             backdrop = st.checkbox("Показывать подложку карты", value=True)
-            points["severity_display"] = points["severity"].fillna("〈значение отсутствует〉")
+            show_grid(current, backdrop)
+            points["severity_display"] = points["has_deaths"].map({True: "С погибшими", False: "Без погибших"}).fillna("Неизвестно")
             fig = px.scatter_map(
                 points, lat="latitude", lon="longitude", color="severity_display",
                 color_discrete_map={
-                    "Легкий": "#3579B8", "Тяжёлый": "#C18A16",
+                    "Без погибших": "#3579B8",
                     "С погибшими": "#B33440", "〈значение отсутствует〉": "#8D939C",
                 },
-                category_orders={"severity_display": ["Легкий", "Тяжёлый", "С погибшими"]},
+                category_orders={"severity_display": ["Без погибших", "С погибшими"]},
                 hover_data=["source_row", "id", "datetime", "category", "region"],
                 labels={"severity_display": "Последствия", **LABELS},
                 opacity=0.6, zoom=5,
@@ -178,7 +230,7 @@ def main() -> None:
     with source:
         columns = ["source_row", "id", "datetime", "region", "category", "severity",
                    "participants_count", "injured_count", "dead_count", "latitude", "longitude"]
-        st.dataframe(current[columns].head(500), hide_index=True, width="stretch")
+        st.dataframe(current[columns].head(500).rename(columns={"source_row": "Строка источника", "id": "ID", "datetime": "Дата и время", "region": "Территория", "category": "Тип ДТП", "severity": "Категория тяжести", "participants_count": "Участников", "injured_count": "Раненых", "dead_count": "Погибших", "latitude": "Широта", "longitude": "Долгота"}), hide_index=True, width="stretch")
         st.caption("Первые 500 записей текущего среза; CSV содержит весь срез.")
         st.download_button(
             "Скачать текущий срез CSV", current[columns].to_csv(index=False).encode("utf-8-sig"),
